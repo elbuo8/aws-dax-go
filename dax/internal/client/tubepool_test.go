@@ -85,6 +85,32 @@ func (m *mockTube) Close() error {
 
 const localConnTimeoutMillis = 10
 
+func TestTubePoolBoot(t *testing.T) {
+	endpoint := ":8181"
+	startConnNotifier := make(chan net.Conn, 25)
+	endConnNotifier := make(chan net.Conn, 25)
+	listener, err := startServer(endpoint, startConnNotifier, endConnNotifier, drainAndCloseConn)
+	if err != nil {
+		t.Fatalf("cannot start server")
+	}
+	defer listener.Close()
+
+	expectedConnections := 5
+
+	pool := newTubePoolWithOptions(endpoint, tubePoolOptions{
+		maxConcurrentConnAttempts: 10,
+		minConnections:            expectedConnections,
+		maxConnections:            20,
+		waitForMinConnections:     true,
+		timeout:                   time.Second * 1,
+		dialContext:               defaultDialer.DialContext,
+	}, connConfigData)
+
+	if countTubes(pool) != expectedConnections {
+		t.Errorf("expected %d connections, got %d", expectedConnections, countTubes(pool))
+	}
+}
+
 func TestTubePoolConnectionCache(t *testing.T) {
 	endpoint := ":8181"
 	var actualConnections, expectedConnections int

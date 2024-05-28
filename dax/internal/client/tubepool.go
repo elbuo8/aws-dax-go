@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -114,12 +115,17 @@ func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigD
 	}
 
 	if options.waitForMinConnections {
+		attemptFailures := 0
 		for i := 0; i < pool.minConnections; i++ {
 			// force it to be serial and push back with time
-			tube, _ := pool.alloc(pool.session, RequestOptions{})
+			tube, err := pool.alloc(pool.session, RequestOptions{})
+			if err != nil {
+				attemptFailures++
+			}
 			pool.put(tube)
-			// TODO: Introduce proper backoff
-			time.Sleep(10 * time.Millisecond)
+			delay := time.Duration(1<<uint64(attemptFailures)) * 10 * time.Millisecond
+			jitter := time.Duration(rand.Intn(int(delay)/2 + 1))
+			time.Sleep(delay/2 + jitter)
 		}
 	}
 
