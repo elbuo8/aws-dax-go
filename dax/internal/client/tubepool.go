@@ -405,9 +405,7 @@ func (p *tubePool) alloc(session int64, opt RequestOptions) (tube, error) {
 // Traverses the passed stack and closes all tubes in it.
 func (p *tubePool) closeAll(head tube) {
 	var next tube
-	closeCount := 0
 	for head != nil {
-		closeCount++
 		p.connectionCount--
 		next = head.Next()
 		head.SetNext(nil)

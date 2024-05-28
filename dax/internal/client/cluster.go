@@ -61,6 +61,7 @@ type Config struct {
 	// TubePool configuration
 	MinConnectionsPerHost int
 	MaxConnectionsPerHost int
+	WaitForMinConnections bool
 
 	ClusterUpdateThreshold    time.Duration
 	ClusterUpdateInterval     time.Duration
@@ -119,6 +120,7 @@ var defaultConfig = Config{
 	MaxPendingConnectionsPerHost: 10,
 	MinConnectionsPerHost:        1,
 	MaxConnectionsPerHost:        100,
+	WaitForMinConnections:        false,
 	ClusterUpdateInterval:        time.Second * 4,
 	ClusterUpdateThreshold:       time.Millisecond * 125,
 	ClientHealthCheckInterval:    time.Second * 5,
@@ -467,6 +469,7 @@ func newCluster(cfg Config) (*cluster, error) {
 	cfg.tubePoolConfig.maxConnections = cfg.MaxConnectionsPerHost
 	cfg.tubePoolConfig.minConnections = cfg.MinConnectionsPerHost
 	cfg.tubePoolConfig.maxConcurrentConnAttempts = cfg.MaxPendingConnectionsPerHost
+	cfg.tubePoolConfig.waitForMinConnections = cfg.WaitForMinConnections
 
 	cfg.validateConnConfig()
 	routeManager := newRouteManager(cfg.RouteManagerEnabled, cfg.ClientHealthCheckInterval, cfg.logger, cfg.logLevel)
