@@ -83,7 +83,9 @@ func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigD
 	if options.minConnections < 1 {
 		options.minConnections = defaultTubePoolOptions.minConnections
 	}
-	// TODO: validation for max connections?
+	if options.maxConnections < options.minConnections {
+		options.maxConnections = options.minConnections
+	}
 
 	if options.dialContext == nil {
 		if connConfigData.isEncrypted {
