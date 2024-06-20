@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -49,18 +50,25 @@ type tubePool struct {
 	session    session // protected by mutex
 	waiters    chan tube
 
+	minConnections  int
+	maxConnections  int
+	connectionCount int
+
 	connConfig connConfig
 }
 
 type tubePoolOptions struct {
 	maxConcurrentConnAttempts int
+	minConnections            int
+	maxConnections            int
+	waitForMinConnections     bool
 	timeout                   time.Duration
 	dialContext               dialContext
 }
 
 var defaultDialer = &net.Dialer{}
 
-var defaultTubePoolOptions = tubePoolOptions{maxConcurrentConnAttempts: 10, timeout: time.Second * 5}
+var defaultTubePoolOptions = tubePoolOptions{maxConcurrentConnAttempts: 10, minConnections: 1, maxConnections: 10, timeout: time.Second * 5}
 
 // Creates a new pool using defaultTubePoolOptions and associated with given address.
 func newTubePool(address string, connConfigData connConfig) *tubePool {
@@ -71,6 +79,12 @@ func newTubePool(address string, connConfigData connConfig) *tubePool {
 func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigData connConfig) *tubePool {
 	if options.maxConcurrentConnAttempts <= 0 {
 		options.maxConcurrentConnAttempts = defaultTubePoolOptions.maxConcurrentConnAttempts
+	}
+	if options.minConnections < 1 {
+		options.minConnections = defaultTubePoolOptions.minConnections
+	}
+	if options.maxConnections < options.minConnections {
+		options.maxConnections = options.minConnections
 	}
 
 	if options.dialContext == nil {
@@ -90,16 +104,34 @@ func newTubePoolWithOptions(address string, options tubePoolOptions, connConfigD
 		}
 	}
 
-	return &tubePool{
-		address:     address,
-		gate:        make(gate, options.maxConcurrentConnAttempts),
-		errCh:       make(chan error),
-		waiters:     make(chan tube),
-		timeout:     options.timeout,
-		dialContext: options.dialContext,
-
-		connConfig: connConfigData,
+	pool := &tubePool{
+		address:        address,
+		gate:           make(gate, options.maxConcurrentConnAttempts),
+		errCh:          make(chan error),
+		waiters:        make(chan tube),
+		timeout:        options.timeout,
+		dialContext:    options.dialContext,
+		minConnections: options.minConnections,
+		maxConnections: options.maxConnections,
+		connConfig:     connConfigData,
 	}
+
+	if options.waitForMinConnections {
+		attemptFailures := 0
+		for i := 0; i < pool.minConnections; i++ {
+			// force it to be serial and push back with time
+			tube, err := pool.alloc(pool.session, RequestOptions{})
+			if err != nil {
+				attemptFailures++
+			}
+			pool.put(tube)
+			delay := time.Duration(1<<uint64(attemptFailures)) * 10 * time.Millisecond
+			jitter := time.Duration(rand.Intn(int(delay)/2 + 1))
+			time.Sleep(delay/2 + jitter)
+		}
+	}
+
+	return pool
 }
 
 // Gets a new or reuses existing tube with timeout context set to tubePool#timeout
@@ -144,11 +176,14 @@ func (p *tubePool) getWithContext(ctx context.Context, highPriority bool, opt Re
 		p.mutex.Unlock()
 
 		var done chan tube
-		if p.gate.tryEnter() {
-			go p.allocAndReleaseGate(session, done, true, opt)
-		} else if highPriority {
-			done = make(chan tube)
-			go p.allocAndReleaseGate(session, done, false, opt)
+
+		if p.connectionCount < p.maxConnections {
+			if p.gate.tryEnter() {
+				go p.allocAndReleaseGate(session, done, true, opt)
+			} else if highPriority {
+				done = make(chan tube)
+				go p.allocAndReleaseGate(session, done, false, opt)
+			}
 		}
 
 		select {
@@ -216,6 +251,7 @@ func (p *tubePool) put(t tube) {
 	defer p.mutex.Unlock()
 
 	if p.closed || t.Session() != p.session {
+		p.connectionCount--
 		t.Close()
 		// Waiters channel was already closed in Close
 		return
@@ -242,6 +278,7 @@ func (p *tubePool) closeTube(t tube) {
 	if t == nil {
 		return
 	}
+	p.connectionCount--
 	if p.closeTubeImmediately {
 		t.Close()
 	} else {
@@ -295,15 +332,53 @@ func (p *tubePool) clearIdleConnections() tube {
 	return head
 }
 
+func countLastActiveTubes(pool *tubePool) int {
+	head := pool.lastActive
+	count := 0
+	for head != nil {
+		count++
+		head = head.Next()
+	}
+	return count
+}
+
+func countTubes(pool *tubePool) int {
+	head := pool.top
+	count := 0
+	for head != nil {
+		count++
+		head = head.Next()
+	}
+	return count
+}
+
 // Closes tubes which weren't used since the last time this method was called.
 func (p *tubePool) reapIdleConnections() {
 	p.mutex.Lock()
 
 	var reapHead tube
 	if !p.closed {
-		if p.lastActive != nil {
-			reapHead = p.lastActive.Next()
-			p.lastActive.SetNext(nil)
+		if p.lastActive != nil && p.connectionCount > p.minConnections {
+			// have to traverse stack until finding the head which has the acceptable
+			// amount of nodes to be reaped to preserve minimum connections
+			inactiveCount := countLastActiveTubes(p)
+			countToDelete := inactiveCount
+			if p.connectionCount-countToDelete < p.minConnections {
+				countToDelete -= p.minConnections - countToDelete
+			}
+
+			reapHead = p.lastActive
+			for i := inactiveCount - 1; i > countToDelete; i-- {
+				if reapHead == nil {
+					break
+				}
+				reapHead = reapHead.Next()
+			}
+			tail := reapHead
+			if tail != nil {
+				reapHead = tail.Next()
+				tail.SetNext(nil)
+			}
 		}
 		p.lastActive = p.top
 	}
@@ -325,6 +400,7 @@ func (p *tubePool) alloc(session int64, opt RequestOptions) (tube, error) {
 		p.logDebug(opt, fmt.Sprintf("DEBUG: Error in allocating new tube for %s : %s", conn.RemoteAddr(), err))
 		return nil, err
 	}
+	p.connectionCount++
 	return t, nil
 }
 
@@ -332,6 +408,7 @@ func (p *tubePool) alloc(session int64, opt RequestOptions) (tube, error) {
 func (p *tubePool) closeAll(head tube) {
 	var next tube
 	for head != nil {
+		p.connectionCount--
 		next = head.Next()
 		head.SetNext(nil)
 		head.Close()
